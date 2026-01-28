@@ -2,6 +2,13 @@
 name = "hyperfind"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
+readme = "README.md"
+description = "Simple Rust application launcher for x11."
+repository = "https://github.com/JakeRoggenbuck/hyperfind"
+homepage = "https://github.com/JakeRoggenbuck/hyperfind"
+categories = ["command-line-utilities"]
+authors = ["jakeroggenbuck <jakeroggenbuck2@gmail.com"]
 
 [dependencies]
 gtk = "0.18"
