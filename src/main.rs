@@ -1,6 +1,12 @@
 use strsim::jaro_winkler;
 use gio::prelude::*;
 use gtk::gdk;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::env;
+use std::fs;
+use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
 use gtk::gdk::prelude::*;
 use gtk::prelude::*;
 use gtk::{Application, ApplicationWindow, Entry, ListBox};
@@ -9,11 +15,82 @@ use std::rc::Rc;
 
 #[derive(Clone)]
 struct AppEntry {
+    key: String,
     name: String,
     icon: Option<gio::Icon>,
     app_info: gio::AppInfo,
 }
 
+#[derive(Clone, Deserialize, Serialize)]
+struct UsageEntry {
+    count: u64,
+    last_used: u64,
+}
+
+type UsageMap = HashMap<String, UsageEntry>;
+
+fn now_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn usage_path() -> Option<PathBuf> {
+    env::var_os("HOME").map(|home| {
+        PathBuf::from(home)
+            .join(".local")
+            .join("share")
+            .join("hyperfind")
+            .join("usage.json")
+    })
+}
+
+fn load_usage() -> UsageMap {
+    let Some(path) = usage_path() else {
+        return HashMap::new();
+    };
+
+    let Ok(contents) = fs::read_to_string(path) else {
+        return HashMap::new();
+    };
+
+    serde_json::from_str(&contents).unwrap_or_default()
+}
+
+fn save_usage(usage: &UsageMap) {
+    let Some(path) = usage_path() else {
+        return;
+    };
+
+    if let Some(parent) = path.parent() {
+        if let Err(err) = fs::create_dir_all(parent) {
+            eprintln!("Failed to create usage dir: {}", err);
+            return;
+        }
+    }
+
+    let Ok(payload) = serde_json::to_string(usage) else {
+        return;
+    };
+
+    if let Err(err) = fs::write(path, payload) {
+        eprintln!("Failed to save usage data: {}", err);
+    }
+}
+
+fn record_usage(key: &str, usage: &mut UsageMap) {
+    let entry = usage.entry(key.to_string()).or_insert(UsageEntry {
+        count: 0,
+        last_used: 0,
+    });
+    entry.count = entry.count.saturating_add(1);
+    entry.last_used = now_unix();
+}
+
+fn usage_key(app: &gio::AppInfo, name: &str) -> String {
+    app.id().map(|id| id.to_string()).unwrap_or_else(|| name.to_string())
+}
 
 fn score_match(name: &str, query: &str) -> Option<i64> {
     let query = query.trim();
@@ -48,7 +125,8 @@ fn load_apps() -> Vec<AppEntry> {
                 None
             } else {
                 let icon = app.icon();
-                Some(AppEntry { name, icon, app_info: app })
+                let key = usage_key(&app, &name);
+                Some(AppEntry { key, name, icon, app_info: app })
             }
         })
         .collect();
@@ -62,15 +140,32 @@ fn update_results(
     apps: &[AppEntry],
     query: &str,
     results: &Rc<RefCell<Vec<AppEntry>>>,
+    usage: &UsageMap,
 ) {
     for child in listbox.children() {
         listbox.remove(&child);
     }
 
-    let mut scored: Vec<(i64, &AppEntry)> = apps
-        .iter()
-        .filter_map(|app| score_match(&app.name, query).map(|score| (score, app)))
-        .collect();
+    let mut scored: Vec<(i64, &AppEntry)> = if query.trim().is_empty() {
+        apps.iter()
+            .filter_map(|app| {
+                usage.get(&app.key).map(|entry| {
+                    let score = (entry.count as i64 * 1000) + entry.last_used as i64;
+                    (score, app)
+                })
+            })
+            .collect()
+    } else {
+        apps.iter()
+            .filter_map(|app| {
+                let mut score = score_match(&app.name, query)?;
+                if let Some(entry) = usage.get(&app.key) {
+                    score += entry.count as i64 * 10;
+                }
+                Some((score, app))
+            })
+            .collect()
+    };
 
     scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.name.cmp(&b.1.name)));
 
@@ -99,7 +194,11 @@ fn update_results(
     }
 }
 
-fn launch_from_index(index: i32, results: &Rc<RefCell<Vec<AppEntry>>>) -> bool {
+fn launch_from_index(
+    index: i32,
+    results: &Rc<RefCell<Vec<AppEntry>>>,
+    usage: &Rc<RefCell<UsageMap>>,
+) -> bool {
     if index < 0 {
         return false;
     }
@@ -116,6 +215,12 @@ fn launch_from_index(index: i32, results: &Rc<RefCell<Vec<AppEntry>>>) -> bool {
     {
         eprintln!("Failed to launch {}: {}", app.name, err);
         return false;
+    }
+
+    {
+        let mut usage_mut = usage.borrow_mut();
+        record_usage(&app.key, &mut usage_mut);
+        save_usage(&usage_mut);
     }
 
     true
@@ -137,14 +242,16 @@ fn main() {
 
         let apps = Rc::new(load_apps());
         let results = Rc::new(RefCell::new(Vec::new()));
+        let usage = Rc::new(RefCell::new(load_usage()));
 
         let listbox = ListBox::new();
         listbox.set_selection_mode(gtk::SelectionMode::Single);
 
         let results_for_activate = Rc::clone(&results);
+        let usage_for_activate = Rc::clone(&usage);
         let app_for_activate = app.clone();
         listbox.connect_row_activated(move |_, row| {
-            if launch_from_index(row.index(), &results_for_activate) {
+            if launch_from_index(row.index(), &results_for_activate, &usage_for_activate) {
                 app_for_activate.quit();
             }
         });
@@ -152,6 +259,7 @@ fn main() {
         let entry_for_keys = entry.clone();
         let listbox_for_keys = listbox.clone();
         let results_for_keys = Rc::clone(&results);
+        let usage_for_keys = Rc::clone(&usage);
         let app_for_keys = app.clone();
         entry.connect_key_press_event(move |_, event| {
             let key = event.keyval();
@@ -164,7 +272,7 @@ fn main() {
                     .selected_row()
                     .or_else(|| listbox_for_keys.row_at_index(0));
                 if let Some(row) = row {
-                    if launch_from_index(row.index(), &results_for_keys) {
+                    if launch_from_index(row.index(), &results_for_keys, &usage_for_keys) {
                         app_for_keys.quit();
                     }
                 }
@@ -177,9 +285,11 @@ fn main() {
         let listbox_for_change = listbox.clone();
         let apps_for_change = Rc::clone(&apps);
         let results_for_change = Rc::clone(&results);
+        let usage_for_change = Rc::clone(&usage);
         entry.connect_changed(move |entry| {
             let query = entry.text().to_string();
-            update_results(&listbox_for_change, &apps_for_change, &query, &results_for_change);
+            let usage_borrow = usage_for_change.borrow();
+            update_results(&listbox_for_change, &apps_for_change, &query, &results_for_change, &usage_borrow);
         });
 
         let container = gtk::Box::new(gtk::Orientation::Vertical, 6);
@@ -239,7 +349,8 @@ fn main() {
             gtk::glib::Propagation::Proceed
         });
 
-        update_results(&listbox, &apps, "", &results);
+        let usage_borrow = usage.borrow();
+        update_results(&listbox, &apps, "", &results, &usage_borrow);
 
         window.show_all();
 
