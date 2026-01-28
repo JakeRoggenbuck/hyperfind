@@ -10,6 +10,7 @@ use std::rc::Rc;
 #[derive(Clone)]
 struct AppEntry {
     name: String,
+    icon: Option<gio::Icon>,
     app_info: gio::AppInfo,
 }
 
@@ -46,7 +47,8 @@ fn load_apps() -> Vec<AppEntry> {
             if name.trim().is_empty() {
                 None
             } else {
-                Some(AppEntry { name, app_info: app })
+                let icon = app.icon();
+                Some(AppEntry { name, icon, app_info: app })
             }
         })
         .collect();
@@ -78,9 +80,16 @@ fn update_results(
     for (_, app) in scored.into_iter().take(10) {
         results_mut.push(app.clone());
         let row = gtk::ListBoxRow::new();
+        let row_box = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        if let Some(icon) = &app.icon {
+            let image = gtk::Image::from_gicon(icon, gtk::IconSize::Menu);
+            image.set_pixel_size(20);
+            row_box.pack_start(&image, false, false, 0);
+        }
         let label = gtk::Label::new(Some(&app.name));
         label.set_xalign(0.0);
-        row.add(&label);
+        row_box.pack_start(&label, true, true, 0);
+        row.add(&row_box);
         listbox.add(&row);
     }
 
@@ -132,7 +141,6 @@ fn main() {
         let listbox = ListBox::new();
         listbox.set_selection_mode(gtk::SelectionMode::Single);
 
-        let listbox_for_activate = listbox.clone();
         let results_for_activate = Rc::clone(&results);
         let app_for_activate = app.clone();
         listbox.connect_row_activated(move |_, row| {
