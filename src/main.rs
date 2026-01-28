@@ -10,7 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use gtk::gdk::prelude::*;
 use gtk::prelude::*;
 use gtk::{Application, ApplicationWindow, Entry, ListBox};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 #[derive(Clone)]
@@ -141,6 +141,7 @@ fn update_results(
     query: &str,
     results: &Rc<RefCell<Vec<AppEntry>>>,
     usage: &UsageMap,
+    show_usage: bool,
 ) {
     for child in listbox.children() {
         listbox.remove(&child);
@@ -181,7 +182,16 @@ fn update_results(
             image.set_pixel_size(20);
             row_box.pack_start(&image, false, false, 0);
         }
-        let label = gtk::Label::new(Some(&app.name));
+        let label_text = if show_usage {
+            if let Some(entry) = usage.get(&app.key) {
+                format!("{}  ({} uses)", app.name, entry.count)
+            } else {
+                format!("{}  (0 uses)", app.name)
+            }
+        } else {
+            app.name.clone()
+        };
+        let label = gtk::Label::new(Some(&label_text));
         label.set_xalign(0.0);
         row_box.pack_start(&label, true, true, 0);
         row.add(&row_box);
@@ -229,9 +239,22 @@ fn launch_from_index(
 fn main() {
     let app = Application::builder()
         .application_id("com.example.hyperfind")
+        .flags(gio::ApplicationFlags::HANDLES_COMMAND_LINE)
         .build();
 
-    app.connect_activate(|app| {
+    let show_usage = Rc::new(Cell::new(false));
+    let show_usage_cmd = Rc::clone(&show_usage);
+    app.connect_command_line(move |app, cmd| {
+        let args = cmd.arguments();
+        if args.iter().any(|arg| arg == "--usage") {
+            show_usage_cmd.set(true);
+        }
+        app.activate();
+        0
+    });
+
+    let show_usage = Rc::clone(&show_usage);
+    app.connect_activate(move |app| {
         if let Some(settings) = gtk::Settings::default() {
             settings.set_property("gtk-error-bell", &false);
         }
@@ -243,6 +266,7 @@ fn main() {
         let apps = Rc::new(load_apps());
         let results = Rc::new(RefCell::new(Vec::new()));
         let usage = Rc::new(RefCell::new(load_usage()));
+        let show_usage = show_usage.get();
 
         let listbox = ListBox::new();
         listbox.set_selection_mode(gtk::SelectionMode::Single);
@@ -289,7 +313,7 @@ fn main() {
         entry.connect_changed(move |entry| {
             let query = entry.text().to_string();
             let usage_borrow = usage_for_change.borrow();
-            update_results(&listbox_for_change, &apps_for_change, &query, &results_for_change, &usage_borrow);
+            update_results(&listbox_for_change, &apps_for_change, &query, &results_for_change, &usage_borrow, show_usage);
         });
 
         let container = gtk::Box::new(gtk::Orientation::Vertical, 6);
@@ -350,7 +374,7 @@ fn main() {
         });
 
         let usage_borrow = usage.borrow();
-        update_results(&listbox, &apps, "", &results, &usage_borrow);
+        update_results(&listbox, &apps, "", &results, &usage_borrow, show_usage);
 
         window.show_all();
 
