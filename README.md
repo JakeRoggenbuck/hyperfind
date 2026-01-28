@@ -7,3 +7,7 @@ Simple Rust application launcher for x11.
 ## Why
 
 I still use dmenu and I used to use [rofi](https://github.com/JakeRoggenbuck/dotfiles/tree/main/rofi). I just want something that does Desktop apps and shows the icons. I also want something I can later add a vector search to. I want something that doesn't need to be configured, and that's opinionated and set up how I want by default. 
+
+## Future
+
+I will add some stuff that makes my computer use easier. Not sure what that will be right now.
