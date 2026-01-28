@@ -1,3 +1,5 @@
+use gtk::gdk;
+use gtk::gdk::prelude::*;
 use gtk::prelude::*;
 use gtk::{Application, ApplicationWindow, Entry};
 
@@ -21,7 +23,14 @@ fn main() {
 
         window.add(&entry);
 
-        window.set_modal(true);
+        window.set_type_hint(gdk::WindowTypeHint::PopupMenu);
+        window.set_skip_taskbar_hint(true);
+        window.set_skip_pager_hint(true);
+        window.connect_realize(|window| {
+            if let Some(gdk_window) = window.window() {
+                gdk_window.set_override_redirect(true);
+            }
+        });
 
         window.show_all();
 
