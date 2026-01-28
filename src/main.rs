@@ -1,17 +1,17 @@
-use strsim::jaro_winkler;
 use gio::prelude::*;
 use gtk::gdk;
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::env;
-use std::fs;
-use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
 use gtk::gdk::prelude::*;
 use gtk::prelude::*;
 use gtk::{Application, ApplicationWindow, Entry, ListBox};
+use serde::{Deserialize, Serialize};
 use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, HashSet};
+use std::env;
+use std::fs;
+use std::path::PathBuf;
 use std::rc::Rc;
+use std::time::{SystemTime, UNIX_EPOCH};
+use strsim::jaro_winkler;
 
 #[derive(Clone)]
 struct AppEntry {
@@ -21,6 +21,11 @@ struct AppEntry {
     app_info: gio::AppInfo,
 }
 
+enum ViewItem {
+    Header(String),
+    App(AppEntry),
+}
+
 #[derive(Clone, Deserialize, Serialize)]
 struct UsageEntry {
     count: u64,
@@ -28,6 +33,15 @@ struct UsageEntry {
 }
 
 type UsageMap = HashMap<String, UsageEntry>;
+
+const MAX_RESULTS: usize = 10;
+const MAX_FREQUENT: usize = 5;
+
+struct ViewState {
+    items: Vec<ViewItem>,
+    offset: usize,
+    selected_index: Option<usize>,
+}
 
 fn now_unix() -> u64 {
     SystemTime::now()
@@ -89,7 +103,9 @@ fn record_usage(key: &str, usage: &mut UsageMap) {
 }
 
 fn usage_key(app: &gio::AppInfo, name: &str) -> String {
-    app.id().map(|id| id.to_string()).unwrap_or_else(|| name.to_string())
+    app.id()
+        .map(|id| id.to_string())
+        .unwrap_or_else(|| name.to_string())
 }
 
 fn score_match(name: &str, query: &str) -> Option<i64> {
@@ -126,7 +142,12 @@ fn load_apps() -> Vec<AppEntry> {
             } else {
                 let icon = app.icon();
                 let key = usage_key(&app, &name);
-                Some(AppEntry { key, name, icon, app_info: app })
+                Some(AppEntry {
+                    key,
+                    name,
+                    icon,
+                    app_info: app,
+                })
             }
         })
         .collect();
@@ -169,11 +190,189 @@ fn build_result_row(app: &AppEntry, usage: &UsageMap, show_usage: bool) -> gtk::
     row
 }
 
-fn score_apps<'a>(
-    apps: &'a [AppEntry],
-    query: &str,
+fn first_selectable_row(listbox: &ListBox) -> Option<gtk::ListBoxRow> {
+    for child in listbox.children() {
+        if let Ok(row) = child.downcast::<gtk::ListBoxRow>() {
+            if row.is_selectable() {
+                return Some(row);
+            }
+        }
+    }
+    None
+}
+
+fn build_section_row(title: &str) -> gtk::ListBoxRow {
+    let row = gtk::ListBoxRow::new();
+    row.set_selectable(false);
+    row.set_activatable(false);
+    let label = gtk::Label::new(None);
+    label.set_markup(&format!("<b>{}</b>", title));
+    label.set_xalign(0.0);
+    label.set_margin_top(0);
+    label.set_margin_bottom(0);
+    row.set_margin_top(0);
+    row.set_margin_bottom(0);
+    row.add(&label);
+    row
+}
+
+fn first_selectable_index(items: &[ViewItem]) -> Option<usize> {
+    items
+        .iter()
+        .position(|item| matches!(item, ViewItem::App(_)))
+}
+
+fn next_selectable_index(items: &[ViewItem], start: usize, direction: i32) -> Option<usize> {
+    let mut index = start as i32 + direction;
+    while index >= 0 && (index as usize) < items.len() {
+        if matches!(items[index as usize], ViewItem::App(_)) {
+            return Some(index as usize);
+        }
+        index += direction;
+    }
+    None
+}
+
+fn ensure_visible(view_state: &mut ViewState) {
+    let Some(selected) = view_state.selected_index else {
+        view_state.offset = 0;
+        return;
+    };
+
+    if view_state.items.is_empty() {
+        view_state.offset = 0;
+        return;
+    }
+
+    if view_state.items.len() <= MAX_RESULTS {
+        view_state.offset = 0;
+        return;
+    }
+
+    if selected < view_state.offset {
+        view_state.offset = selected;
+        return;
+    }
+
+    loop {
+        let mut app_count = 0;
+        let mut last_visible = None;
+        for (idx, item) in view_state.items.iter().enumerate().skip(view_state.offset) {
+            if matches!(item, ViewItem::App(_)) {
+                if app_count >= MAX_RESULTS {
+                    break;
+                }
+                app_count += 1;
+            }
+            last_visible = Some(idx);
+            if app_count >= MAX_RESULTS {
+                break;
+            }
+        }
+
+        let Some(last_visible) = last_visible else {
+            break;
+        };
+        if selected <= last_visible {
+            break;
+        }
+        view_state.offset = view_state.offset.saturating_add(1);
+    }
+}
+
+fn render_view(
+    listbox: &ListBox,
+    view_state: &ViewState,
+    results: &Rc<RefCell<Vec<Option<AppEntry>>>>,
     usage: &UsageMap,
-) -> Vec<(i64, &'a AppEntry)> {
+    show_usage: bool,
+) {
+    clear_listbox(listbox);
+
+    let mut results_mut = results.borrow_mut();
+    results_mut.clear();
+
+    let mut app_count = 0;
+    let mut visible_indices = Vec::new();
+    for (idx, item) in view_state.items.iter().enumerate().skip(view_state.offset) {
+        if matches!(item, ViewItem::App(_)) && app_count >= MAX_RESULTS {
+            break;
+        }
+        match item {
+            ViewItem::Header(title) => {
+                results_mut.push(None);
+                let row = build_section_row(title);
+                listbox.add(&row);
+            }
+            ViewItem::App(app) => {
+                results_mut.push(Some(app.clone()));
+                let row = build_result_row(app, usage, show_usage);
+                listbox.add(&row);
+                app_count += 1;
+            }
+        }
+        visible_indices.push(idx);
+    }
+
+    listbox.show_all();
+    if let Some(selected) = view_state.selected_index {
+        if let Some(row_index) = visible_indices.iter().position(|idx| *idx == selected) {
+            if let Some(row) = listbox.row_at_index(row_index as i32) {
+                listbox.select_row(Some(&row));
+            }
+        }
+    }
+}
+
+fn build_view_items(apps: &[AppEntry], query: &str, usage: &UsageMap) -> Vec<ViewItem> {
+    if !query.trim().is_empty() {
+        let mut scored = score_apps(apps, query, usage);
+        scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.name.cmp(&b.1.name)));
+        return scored
+            .into_iter()
+            .map(|(_, app)| ViewItem::App(app.clone()))
+            .collect();
+    }
+
+    let mut frequent: Vec<(i64, &AppEntry)> = apps
+        .iter()
+        .filter_map(|app| {
+            usage.get(&app.key).map(|entry| {
+                let score = (entry.count as i64 * 1000) + entry.last_used as i64;
+                (score, app)
+            })
+        })
+        .collect();
+    frequent.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.name.cmp(&b.1.name)));
+    let frequent: Vec<&AppEntry> = frequent
+        .into_iter()
+        .map(|(_, app)| app)
+        .take(MAX_FREQUENT)
+        .collect();
+
+    let mut items = Vec::new();
+    if !frequent.is_empty() {
+        items.push(ViewItem::Header("Frequently Used".to_string()));
+        for app in &frequent {
+            items.push(ViewItem::App((*app).clone()));
+        }
+    }
+
+    items.push(ViewItem::Header("All Apps".to_string()));
+
+    let mut frequent_keys = HashSet::new();
+    for app in frequent {
+        frequent_keys.insert(app.key.clone());
+    }
+
+    for app in apps.iter().filter(|app| !frequent_keys.contains(&app.key)) {
+        items.push(ViewItem::App(app.clone()));
+    }
+
+    items
+}
+
+fn score_apps<'a>(apps: &'a [AppEntry], query: &str, usage: &UsageMap) -> Vec<(i64, &'a AppEntry)> {
     if query.trim().is_empty() {
         return apps
             .iter()
@@ -197,41 +396,53 @@ fn score_apps<'a>(
         .collect()
 }
 
-fn select_first_row(listbox: &ListBox) {
-    if let Some(row) = listbox.row_at_index(0) {
-        listbox.select_row(Some(&row));
-    }
+fn update_results(listbox: &ListBox, state: &LauncherState, query: &str, show_usage: bool) {
+    let usage_borrow = state.usage.borrow();
+    let mut view_state = state.view.borrow_mut();
+    view_state.items = build_view_items(&state.apps, query, &usage_borrow);
+    view_state.offset = 0;
+    view_state.selected_index = first_selectable_index(&view_state.items);
+    render_view(
+        listbox,
+        &view_state,
+        &state.results,
+        &usage_borrow,
+        show_usage,
+    );
 }
 
-fn update_results(
-    listbox: &ListBox,
-    apps: &[AppEntry],
-    query: &str,
-    results: &Rc<RefCell<Vec<AppEntry>>>,
-    usage: &UsageMap,
-    show_usage: bool,
-) {
-    clear_listbox(listbox);
+fn move_selection(listbox: &ListBox, state: &LauncherState, direction: i32, show_usage: bool) {
+    let usage_borrow = state.usage.borrow();
+    let mut view_state = state.view.borrow_mut();
+    let Some(current) = view_state.selected_index else {
+        view_state.selected_index = first_selectable_index(&view_state.items);
+        ensure_visible(&mut view_state);
+        render_view(
+            listbox,
+            &view_state,
+            &state.results,
+            &usage_borrow,
+            show_usage,
+        );
+        return;
+    };
 
-    let mut scored = score_apps(apps, query, usage);
-    scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.name.cmp(&b.1.name)));
-
-    let mut results_mut = results.borrow_mut();
-    results_mut.clear();
-
-    for (_, app) in scored.into_iter().take(10) {
-        results_mut.push(app.clone());
-        let row = build_result_row(app, usage, show_usage);
-        listbox.add(&row);
+    if let Some(next) = next_selectable_index(&view_state.items, current, direction) {
+        view_state.selected_index = Some(next);
+        ensure_visible(&mut view_state);
+        render_view(
+            listbox,
+            &view_state,
+            &state.results,
+            &usage_borrow,
+            show_usage,
+        );
     }
-
-    listbox.show_all();
-    select_first_row(listbox);
 }
 
 fn launch_from_index(
     index: i32,
-    results: &Rc<RefCell<Vec<AppEntry>>>,
+    results: &Rc<RefCell<Vec<Option<AppEntry>>>>,
     usage: &Rc<RefCell<UsageMap>>,
 ) -> bool {
     if index < 0 {
@@ -240,7 +451,7 @@ fn launch_from_index(
 
     let results = results.borrow();
     let index = index as usize;
-    let Some(app) = results.get(index) else {
+    let Some(Some(app)) = results.get(index) else {
         return false;
     };
 
@@ -261,11 +472,12 @@ fn launch_from_index(
     true
 }
 
-
+#[derive(Clone)]
 struct LauncherState {
     apps: Rc<Vec<AppEntry>>,
-    results: Rc<RefCell<Vec<AppEntry>>>,
+    results: Rc<RefCell<Vec<Option<AppEntry>>>>,
     usage: Rc<RefCell<UsageMap>>,
+    view: Rc<RefCell<ViewState>>,
 }
 
 impl LauncherState {
@@ -274,6 +486,11 @@ impl LauncherState {
             apps: Rc::new(load_apps()),
             results: Rc::new(RefCell::new(Vec::new())),
             usage: Rc::new(RefCell::new(load_usage())),
+            view: Rc::new(RefCell::new(ViewState {
+                items: Vec::new(),
+                offset: 0,
+                selected_index: None,
+            })),
         }
     }
 }
@@ -290,12 +507,13 @@ fn build_listbox() -> ListBox {
     listbox
 }
 
-fn build_container(entry: &Entry, listbox: &ListBox) -> gtk::Box {
+fn build_container(title: &gtk::Label, entry: &Entry, listbox: &ListBox) -> gtk::Box {
     let container = gtk::Box::new(gtk::Orientation::Vertical, 6);
     container.set_margin_top(8);
     container.set_margin_bottom(8);
     container.set_margin_start(10);
     container.set_margin_end(10);
+    container.pack_start(title, false, false, 0);
     container.pack_start(entry, false, false, 0);
     container.pack_start(listbox, true, true, 0);
     container
@@ -373,15 +591,7 @@ fn build_window(app: &Application, container: &gtk::Box) -> ApplicationWindow {
 }
 
 fn refresh_results(listbox: &ListBox, state: &LauncherState, show_usage: bool) {
-    let usage_borrow = state.usage.borrow();
-    update_results(
-        listbox,
-        &state.apps,
-        "",
-        &state.results,
-        &usage_borrow,
-        show_usage,
-    );
+    update_results(listbox, state, "", show_usage);
 }
 
 fn focus_entry_later(entry: &Entry) {
@@ -407,11 +617,13 @@ fn connect_entry_key_handler(
     listbox: &ListBox,
     state: &LauncherState,
     app: &Application,
+    show_usage: bool,
 ) {
     let entry_for_keys = entry.clone();
     let listbox_for_keys = listbox.clone();
     let results_for_keys = Rc::clone(&state.results);
     let usage_for_keys = Rc::clone(&state.usage);
+    let state_for_keys = state.clone();
     let app_for_keys = app.clone();
     entry.connect_key_press_event(move |_, event| {
         let key = event.keyval();
@@ -419,10 +631,18 @@ fn connect_entry_key_handler(
             app_for_keys.quit();
             return gtk::glib::Propagation::Stop;
         }
+        if key == gdk::keys::constants::Down {
+            move_selection(&listbox_for_keys, &state_for_keys, 1, show_usage);
+            return gtk::glib::Propagation::Stop;
+        }
+        if key == gdk::keys::constants::Up {
+            move_selection(&listbox_for_keys, &state_for_keys, -1, show_usage);
+            return gtk::glib::Propagation::Stop;
+        }
         if key == gdk::keys::constants::Return || key == gdk::keys::constants::KP_Enter {
             let row = listbox_for_keys
                 .selected_row()
-                .or_else(|| listbox_for_keys.row_at_index(0));
+                .or_else(|| first_selectable_row(&listbox_for_keys));
             if let Some(row) = row {
                 if launch_from_index(row.index(), &results_for_keys, &usage_for_keys) {
                     app_for_keys.quit();
@@ -442,20 +662,10 @@ fn connect_entry_change_handler(
     show_usage: bool,
 ) {
     let listbox_for_change = listbox.clone();
-    let apps_for_change = Rc::clone(&state.apps);
-    let results_for_change = Rc::clone(&state.results);
-    let usage_for_change = Rc::clone(&state.usage);
+    let state_for_change = state.clone();
     entry.connect_changed(move |entry| {
         let query = entry.text().to_string();
-        let usage_borrow = usage_for_change.borrow();
-        update_results(
-            &listbox_for_change,
-            &apps_for_change,
-            &query,
-            &results_for_change,
-            &usage_borrow,
-            show_usage,
-        );
+        update_results(&listbox_for_change, &state_for_change, &query, show_usage);
     });
 }
 
@@ -466,16 +676,17 @@ fn connect_entry_handlers(
     app: &Application,
     show_usage: bool,
 ) {
-    connect_entry_key_handler(entry, listbox, state, app);
+    connect_entry_key_handler(entry, listbox, state, app, show_usage);
     connect_entry_change_handler(entry, listbox, state, show_usage);
 }
 
 fn build_ui(app: &Application, show_usage: bool) {
     configure_settings();
 
-    let entry = Entry::builder()
-        .placeholder_text("Search…")
-        .build();
+    let title = gtk::Label::new(Some("HyperFind"));
+    title.set_xalign(0.0);
+
+    let entry = Entry::builder().placeholder_text("Search…").build();
 
     let state = LauncherState::new();
     let listbox = build_listbox();
@@ -483,7 +694,7 @@ fn build_ui(app: &Application, show_usage: bool) {
     connect_listbox_activation(&listbox, &state, app);
     connect_entry_handlers(&entry, &listbox, &state, app, show_usage);
 
-    let container = build_container(&entry, &listbox);
+    let container = build_container(&title, &entry, &listbox);
     let window = build_window(app, &container);
 
     refresh_results(&listbox, &state, show_usage);
