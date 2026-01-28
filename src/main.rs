@@ -9,9 +9,11 @@ fn main() {
         .build();
 
     app.connect_activate(|app| {
-        let entry = Entry::builder()
-            .placeholder_text("Search…")
-            .build();
+        if let Some(settings) = gtk::Settings::default() {
+            settings.set_property("gtk-error-bell", &false);
+        }
+
+        let entry = Entry::builder().placeholder_text("Search…").build();
 
         let app_clone = app.clone();
         entry.connect_key_press_event(move |_, event| {
@@ -29,6 +31,8 @@ fn main() {
             .default_height(60)
             .resizable(false)
             .build();
+
+        window.set_position(gtk::WindowPosition::Center);
 
         window.add(&entry);
 
